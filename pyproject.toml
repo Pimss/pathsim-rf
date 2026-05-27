@@ -30,6 +30,11 @@ dependencies = [
     "numpy>=1.15",
     "scipy>=1.2",
     "scikit-rf>=0.30",
+    # If a dependency ships native code that can't be installed in Pyodide,
+    # tag it with `; sys_platform != 'emscripten'` so a normal pip install
+    # still pulls it eagerly but micropip in the browser skips it. Pair
+    # this with a defensive re-export in `pathsim_rf/__init__.py`
+    # (the `.network` submodule already follows this pattern).
 ]
 
 [dependency-groups]
