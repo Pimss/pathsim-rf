@@ -26,7 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "pathsim>0.13",
+    "pathsim>=0.22",
     "numpy>=1.15",
     "scipy>=1.2",
     "scikit-rf>=0.30",
