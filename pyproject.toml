@@ -31,7 +31,7 @@ dependencies = [
     "scipy>=1.2",
     "scikit-rf>=0.30",
     "sympy>=1.14",
-    "python-mumps>=0.0.4; sys_platform != 'emscripten'",
+    "python-mumps>=0.0.4; python_version >= '3.11' and sys_platform != 'emscripten'",
     # If a dependency ships native code that can't be installed in Pyodide,
     # tag it with `; sys_platform != 'emscripten'` so a normal pip install
     # still pulls it eagerly but micropip in the browser skips it. Pair
