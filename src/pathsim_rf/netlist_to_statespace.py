@@ -279,12 +279,11 @@ class CircuitModel:
         Method used to eliminate the algebraic MNA variables:
 
         ``"symbolic"``
-            Stamp and reduce with SymPy matrices. Matrix inverses and products
-            retain symbolic arithmetic until the final conversion to floating
-            point. This is the default and is useful for small circuits,
-            reference results, and diagnosing rank deficiencies. Its runtime
-            and memory use can grow quickly on large or densely coupled
-            circuits.
+            Stamp the MNA system with SymPy, convert the selected matrix blocks
+            to floating point, and reduce them with SciPy sparse LU solves.
+            This is the default and does not require ``python-mumps``. Keeping
+            symbolic stamping preserves the reference assembly path while
+            avoiding expensive symbolic matrix inverses on large circuits.
 
         ``"fast"``
             Stamp directly into floating-point arrays. Eliminate the algebraic
@@ -685,61 +684,87 @@ class CircuitModel:
 
         raise ValueError(f"Failed to solve {context} with numeric LU.")
 
+    @staticmethod
+    def _solve_with_scipy(mat: np.ndarray, rhs: np.ndarray, context: str) -> np.ndarray:
+        """Solve right-hand sides with SciPy sparse LU and bounded regularization."""
+        import scipy.sparse as sps
+        from scipy.sparse.linalg import splu
+
+        rhs_2d = rhs if rhs.ndim == 2 else rhs.reshape((-1, 1))
+        if mat.shape[0] != mat.shape[1]:
+            raise ValueError(f"{context} matrix must be square, got {mat.shape}")
+        if rhs_2d.shape[0] != mat.shape[0]:
+            raise ValueError(
+                f"{context} rhs has incompatible shape {rhs_2d.shape} for matrix {mat.shape}"
+            )
+
+        last_error: Exception | None = None
+        for eps in (0.0, 1e-15, 1e-12, 1e-9, 1e-6):
+            try:
+                matrix = mat if eps == 0.0 else mat + eps * np.eye(mat.shape[0])
+                factor = splu(sps.csc_matrix(matrix))
+                columns = [
+                    np.asarray(factor.solve(np.asarray(column, dtype=float)), dtype=float)
+                    for column in rhs_2d.T
+                ]
+                solution = np.column_stack(columns)
+                if eps > 0.0:
+                    warnings.warn(
+                        f"Symbolic reduction regularized singular {context} with eps={eps:.1e}",
+                        RuntimeWarning,
+                    )
+                return solution if rhs.ndim == 2 else solution[:, 0]
+            except (RuntimeError, ValueError) as exc:
+                last_error = exc
+
+        raise ValueError(f"Failed to solve {context} with SciPy sparse LU.") from last_error
+
     def _reduce_symbolic(self):
         """
-        Eliminate algebraic variables using symbolic SymPy arithmetic.
+        Stamp with SymPy and eliminate algebraic variables using SciPy.
 
-        With differential and algebraic variables denoted by ``x_d`` and
-        ``x_a``, the algebraic MNA rows are
-
-        ``G_alg_d*x_d + G_alg_a*x_a = B_alg*u``.
-
-        The method computes
-
-        ``Phi = -inv(G_alg_a)*G_alg_d`` and
-        ``Psi = inv(G_alg_a)*B_alg``,
-
-        so that ``x_a = Phi*x_d + Psi*u``. Substitution into the differential
-        rows yields
-
-        ``A = -inv(E_dd)*(G_diff_d + G_diff_a*Phi)`` and
-        ``B_ss = inv(E_dd)*(B_diff - G_diff_a*Psi)``.
-
-        SymPy retains symbolic values through elimination and converts only the
-        final state matrices to ``float`` arrays. This makes the mode useful as
-        a correctness reference for small circuits, but explicit symbolic
-        inverses can become expensive in time and memory as the netlist grows.
-        Singular algebraic and state matrices are reported without numerical
+        The symbolic MNA blocks are converted to floating-point arrays before
+        factorization. SciPy sparse LU then solves for ``Phi`` and ``Psi`` and
+        the differential mass system without forming explicit inverses. This
+        retains the default SymPy stamping implementation while making the
+        reduction practical for substantially larger circuits. Unlike fast
+        mode, this path requires no ``python-mumps`` and applies no diagonal
         regularization.
         """
         E, G, B = self.E, self.G, self.B
         dr, ar = self.diff_rows, self.alg_rows
         dc, ac = self.diff_cols, self.alg_cols
 
-        E_dd = E[dr, dc]                       # square, the "mass"/coupling matrix
-        G_alg_d = G[ar, dc]
-        G_alg_a = G[ar, ac]
-        G_diff_d = G[dr, dc]
-        G_diff_a = G[dr, ac]
-        B_alg = B[ar, :]
-        B_diff = B[dr, :]
+        E_dd = np.array(E[dr, dc], dtype=float)
+        G_alg_d = np.array(G[ar, dc], dtype=float)
+        G_alg_a = np.array(G[ar, ac], dtype=float)
+        G_diff_d = np.array(G[dr, dc], dtype=float)
+        G_diff_a = np.array(G[dr, ac], dtype=float)
+        B_alg = np.array(B[ar, :], dtype=float)
+        B_diff = np.array(B[dr, :], dtype=float)
 
         try:
-            G_alg_a_inv = G_alg_a.inv()
-        except sp.matrices.exceptions.NonInvertibleMatrixError:
+            Phi = -self._solve_with_scipy(G_alg_a, G_alg_d, "algebraic subsystem")
+            Psi = self._solve_with_scipy(G_alg_a, B_alg, "algebraic subsystem")
+        except ValueError:
             self._raise_algebraic_singular()
-        Phi = -G_alg_a_inv * G_alg_d           # x_a = Phi * x_d + Psi * u
-        Psi = G_alg_a_inv * B_alg
 
         try:
-            E_dd_inv = E_dd.inv()
-        except sp.matrices.exceptions.NonInvertibleMatrixError:
+            A = -self._solve_with_scipy(
+                E_dd,
+                G_diff_d + self._safe_matmul(G_diff_a, Phi),
+                "state/mass subsystem",
+            )
+            Bmat = self._solve_with_scipy(
+                E_dd,
+                B_diff - self._safe_matmul(G_diff_a, Psi),
+                "state/mass subsystem",
+            )
+        except ValueError:
             self._raise_state_singular()
-        A = -E_dd_inv * (G_diff_d + G_diff_a * Phi)
-        Bmat = E_dd_inv * (B_diff - G_diff_a * Psi)
 
-        self.A = np.array(A.evalf(), dtype=float)
-        self.B_ss = np.array(Bmat.evalf(), dtype=float)
+        self.A = A
+        self.B_ss = Bmat
         self.Phi = Phi
         self.Psi = Psi
 
@@ -845,17 +870,9 @@ class CircuitModel:
 
         vec_d = vec[:, self.diff_cols]
         vec_a = vec[:, self.alg_cols]
-        if self.reduction_mode == "fast":
-            C = vec_d + self._safe_matmul(vec_a, self.Phi)
-            D = self._safe_matmul(vec_a, self.Psi)
-            return C, D
-
-        vec_sym = sp.Matrix(vec.tolist())
-        vec_d_sym = vec_sym[:, self.diff_cols]
-        vec_a_sym = vec_sym[:, self.alg_cols]
-        C = vec_d_sym + vec_a_sym * self.Phi
-        D = vec_a_sym * self.Psi
-        return np.array(C.evalf(), dtype=float), np.array(D.evalf(), dtype=float)
+        C = vec_d + self._safe_matmul(vec_a, self.Phi)
+        D = self._safe_matmul(vec_a, self.Psi)
+        return C, D
 
     def _build_output_row(
         self,
