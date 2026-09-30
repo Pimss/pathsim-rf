@@ -351,6 +351,10 @@ class CircuitModel:
         # ---- inputs: one column per V source, then one column per I source ----
         self.input_names = self.V_names + [e.name for e in self.I]
         self.n_u = len(self.input_names)
+        if self.n_u == 0:
+            raise ValueError(
+                "Circuit must contain at least one independent voltage or current source."
+            )
 
         # ---- build E (dynamic) and G (algebraic) matrices, and B (input map) ----
         n = self.n_total
@@ -545,13 +549,13 @@ class CircuitModel:
         dr, ar = self.diff_rows, self.alg_rows
         dc, ac = self.diff_cols, self.alg_cols
 
-        E_dd = np.array(E[dr, dc], dtype=float)
-        G_alg_d = np.array(G[ar, dc], dtype=float)
-        G_alg_a = np.array(G[ar, ac], dtype=float)
-        G_diff_d = np.array(G[dr, dc], dtype=float)
-        G_diff_a = np.array(G[dr, ac], dtype=float)
-        B_alg = np.array(B[ar, :], dtype=float)
-        B_diff = np.array(B[dr, :], dtype=float)
+        E_dd = E[np.ix_(dr, dc)]
+        G_alg_d = G[np.ix_(ar, dc)]
+        G_alg_a = G[np.ix_(ar, ac)]
+        G_diff_d = G[np.ix_(dr, dc)]
+        G_diff_a = G[np.ix_(dr, ac)]
+        B_alg = B[ar, :]
+        B_diff = B[dr, :]
 
         try:
             Phi = -self._solve_with_scipy(G_alg_a, G_alg_d, "algebraic subsystem")
