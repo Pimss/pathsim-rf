@@ -22,7 +22,7 @@ class TestNetlistStateSpace(unittest.TestCase):
     def test_path_string_matches_manual_circuit_model(self):
         """Test CircuitModel is correctly used within NetlistStateSpace"""
         netlist_path = "filter.net"
-        model = CircuitModel(parse_netlist_file(netlist_path), reduction_mode="symbolic")
+        model = CircuitModel(parse_netlist_file(netlist_path))
         model.add_node_voltage_output("n1")
         model.add_dipole_current_output("Rload")
         A, B, C, D = model.get_system()
@@ -30,9 +30,7 @@ class TestNetlistStateSpace(unittest.TestCase):
         block = NetlistStateSpace(
             str(netlist_path),
             output_voltages=["n1"],
-            output_currents=["Rload"],
-            reduction_mode="symbolic",
-        )
+            output_currents=["Rload"])
 
         self.assertIsInstance(block, StateSpace)
         np.testing.assert_allclose(block.A, A)
@@ -47,9 +45,7 @@ class TestNetlistStateSpace(unittest.TestCase):
         """Test current sources feedback used to chain models"""
         block = NetlistStateSpace("filter_without_load.net",
             output_voltages=["n1"],
-            output_currents=["Lfilter"],
-            reduction_mode="symbolic",
-        )
+            output_currents=["Lfilter"])
 
         self.assertEqual(block.input_labels, ["V1", "Bload"])
         self.assertEqual(block.output_labels, ["V(n1)", "I(Lfilter)"])
@@ -65,9 +61,7 @@ class TestNetlistStateSpace(unittest.TestCase):
             C1 out 0 1u
             """,
             output_voltages=["out"],
-            output_currents=["R1", "V1"],
-            reduction_mode="symbolic",
-        )
+            output_currents=["R1", "V1"])
 
         self.assertEqual(block.input_labels, ["V1"])
         self.assertEqual(block.output_labels, ["V(out)", "I(R1)", "I(V1)"])
@@ -86,30 +80,6 @@ class TestNetlistStateSpace(unittest.TestCase):
             NetlistStateSpace(netlist_path, output_voltages=["missing"])
         with self.assertRaisesRegex(ValueError, "Unknown dipole"):
             NetlistStateSpace(netlist_path, output_currents=["R404"])
-
-@unittest.skipUnless(importlib.util.find_spec("mumps"), "python-mumps is not installed")
-class TestFastReduction(unittest.TestCase):
-    """Class validation the fast implementation for reduction mode using mumps
-       using python-mumps"""
-    def test_fast_mode_matches_symbolic_on_small_case(self):
-        """Test if fast reduction mode is equivalent to symbolic
-            skipped if mumps not installed"""
-        elements = parse_netlist(
-            """
-            V1 n1 0 1
-            R1 n1 n2 2k
-            C1 n2 0 2u
-            L1 n2 n3 3m
-            L2 n3 0 5m
-            R2 n3 0 4k
-            K1 L1 L2 0.1
-            """
-        )
-        symbolic = CircuitModel(elements, reduction_mode="symbolic")
-        fast = CircuitModel(elements, reduction_mode="fast")
-
-        np.testing.assert_allclose(fast.A, symbolic.A, rtol=1e-9, atol=1e-12)
-        np.testing.assert_allclose(fast.B_ss, symbolic.B_ss, rtol=1e-9, atol=1e-12)
 
 
 # RUN TESTS LOCALLY ====================================================================
