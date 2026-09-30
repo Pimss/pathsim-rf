@@ -96,19 +96,6 @@ class TestNetlistParser(unittest.TestCase):
         self.assertEqual(D.shape, (0, B.shape[1]))
         self.assertEqual(model.output_labels, [])
 
-    def test_fast_mode_falls_back_to_symbolic_without_mumps(self):
-        """Test class falling back to sympy if mumps not installed"""
-        elements = parse_netlist("V1 in 0 1\nR1 in out 10\nC1 out 0 1u")
-        with patch.object(pathsim_rf.netlist_to_statespace, "_MUMPS_AVAILABLE", False):
-            model = CircuitModel(elements, reduction_mode="fast")
-
-        self.assertEqual(model.reduction_mode, "symbolic")
-
-    def test_invalid_reduction_mode_raises(self):
-        """Test class raising an error for unknown reduction type"""
-        with self.assertRaises(ValueError):
-            CircuitModel(parse_netlist("R1 n1 0 1k"), reduction_mode="unknown")
-
     def test_outputs_accumulate_for_all_supported_dipoles(self):
         """Test output currents can be selected as StateSpace output for all dipole types"""
         model = CircuitModel(
@@ -121,7 +108,6 @@ class TestNetlistParser(unittest.TestCase):
                 I1 n2 0 1
                 """
             ),
-            reduction_mode="symbolic",
         )
 
         model.add_node_voltage_output("n2")
@@ -138,12 +124,14 @@ class TestNetlistParser(unittest.TestCase):
         np.testing.assert_allclose(C[-1], 0.0)
         np.testing.assert_allclose(D[-1], [0.0, 1.0])
 
+    def test_model_without_inputs_raises(self):
+        """Test error in case of no input present in netlist (in the form of current or voltage source)"""
+        with self.assertRaisesRegex(ValueError, "at least one independent"):
+            CircuitModel(parse_netlist("R1 n1 0 1k\nC1 n1 0 1u"))
+
     def test_unknown_node_and_dipole_raise(self):
         """Test error in case of unknown dipole or node selected as output"""
-        model = CircuitModel(
-            parse_netlist("V1 n1 0 1\nR1 n1 n2 1k\nC1 n2 0 1u"),
-            reduction_mode="symbolic",
-        )
+        model = CircuitModel(parse_netlist("V1 n1 0 1\nR1 n1 n2 1k\nC1 n2 0 1u"))
         with self.assertRaisesRegex(ValueError, "Unknown node"):
             model.add_node_voltage_output("missing")
         with self.assertRaisesRegex(ValueError, "Unknown dipole"):
