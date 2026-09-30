@@ -19,14 +19,10 @@ the accompanying explanation).
 """
 
 from __future__ import annotations
-import sympy as sp
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
-import importlib.util
-import logging
 import re
-from typing import Literal
 import warnings
 
 from pathsim.blocks.lti import StateSpace
@@ -73,9 +69,6 @@ _VALUE_PATTERN = re.compile(
 )
 _VALID_KINDS = {"R", "L", "C", "V", "I", "K"}
 _IGNORED_LINE_STARTS = (".", "*", '"')
-ReductionMode = Literal["symbolic", "fast"]
-_MUMPS_AVAILABLE = importlib.util.find_spec("mumps") is not None
-_LOGGER = logging.getLogger("pathsim.netlist_to_statespace")
 
 
 def _normalize_node(node: str) -> str:
@@ -247,7 +240,7 @@ GND = {'0', 'gnd', 'GND'}
 
 
 # --------------------------------------------------------------------------
-# MNA + symbolic DAE -> explicit state space reduction
+# MNA DAE -> explicit state space reduction
 # --------------------------------------------------------------------------
 
 class CircuitModel:
@@ -268,34 +261,15 @@ class CircuitModel:
 
     ``dx_d/dt = A * x_d + B_ss * u``.
 
-    Both reduction modes produce the same matrices and state ordering. They
-    differ only in the arithmetic and linear solver used during elimination.
+    The MNA matrices are stamped directly into floating-point arrays and
+    reduced using SciPy sparse LU solves. Singular solves are retried with
+    bounded diagonal regularization and emit :class:`RuntimeWarning` when
+    regularization is used.
 
     Parameters
     ----------
     elements:
         Output of :func:`parse_netlist` / :func:`parse_netlist_file`.
-    reduction_mode:
-        Method used to eliminate the algebraic MNA variables:
-
-        ``"symbolic"``
-            Stamp the MNA system with SymPy, convert the selected matrix blocks
-            to floating point, and reduce them with SciPy sparse LU solves.
-            This is the default and does not require ``python-mumps``. Keeping
-            symbolic stamping preserves the reference assembly path while
-            avoiding expensive symbolic matrix inverses on large circuits.
-
-        ``"fast"``
-            Stamp directly into floating-point arrays. Eliminate the algebraic
-            subsystem with a sparse MUMPS factorization, then solve the
-            differential mass system numerically. This mode is intended for
-            large RLC/K netlists and repeated output construction. A singular
-            algebraic solve is retried with progressively larger diagonal
-            regularization and emits :class:`RuntimeWarning` when regularization
-            is used. When ``python-mumps`` is unavailable, construction falls
-            back to symbolic reduction and logs a warning through PathSim.
-
-        The mode affects model construction only
 
     Attributes
     ----------
@@ -311,23 +285,8 @@ class CircuitModel:
         Labels matching the row and column ordering of the state matrices.
     """
 
-    def __init__(
-        self,
-        elements: list[Element],
-        reduction_mode: ReductionMode = "symbolic",
-    ):
-        if reduction_mode not in {"symbolic", "fast"}:
-            raise ValueError(
-                f"Unsupported reduction_mode '{reduction_mode}'. "
-                "Expected 'symbolic' or 'fast'."
-            )
-        if reduction_mode == "fast" and not _MUMPS_AVAILABLE:
-            _LOGGER.warning(
-                "Fast netlist reduction requires python-mumps; "
-                "falling back to symbolic reduction."
-            )
-            reduction_mode = "symbolic"
-        self.reduction_mode = reduction_mode
+    def __init__(self, elements: list[Element]):
+
         self.elements = elements
 
         self.R = [e for e in elements if e.kind == 'R']
@@ -373,26 +332,18 @@ class CircuitModel:
             return self.n_nodes + self.n_L + self.V_idx[name]
 
         self._col_node, self._col_iL, self._col_iV = col_node, col_iL, col_iV
-        numeric = self.reduction_mode == "fast"
 
         # ---- inductance matrix (with mutual terms) ----
-        Lmat = (
-            np.zeros((self.n_L, self.n_L), dtype=float)
-            if numeric
-            else sp.zeros(self.n_L, self.n_L)
-        )
+        Lmat = np.zeros((self.n_L, self.n_L), dtype=float)
         l_values = {e.name: e.value for e in self.L}
         for e in self.L:
             i = self.L_idx[e.name]
-            Lmat[i, i] = float(e.value) if numeric else sp.nsimplify(e.value)
+            Lmat[i, i] = float(e.value)
         for k in self.K:
             i, j = self.L_idx[k.l1], self.L_idx[k.l2]
             Li = l_values[k.l1]
             Lj = l_values[k.l2]
-            if numeric:
-                M = float(k.value) * np.sqrt(float(Li) * float(Lj))
-            else:
-                M = sp.nsimplify(k.value) * sp.sqrt(sp.nsimplify(Li) * sp.nsimplify(Lj))
+            M = float(k.value) * np.sqrt(float(Li) * float(Lj))
             Lmat[i, j] += M
             Lmat[j, i] += M
         self.Lmat = Lmat
@@ -403,14 +354,9 @@ class CircuitModel:
 
         # ---- build E (dynamic) and G (algebraic) matrices, and B (input map) ----
         n = self.n_total
-        if numeric:
-            E = np.zeros((n, n), dtype=float)
-            G = np.zeros((n, n), dtype=float)
-            B = np.zeros((n, self.n_u), dtype=float)
-        else:
-            E = sp.zeros(n, n)
-            G = sp.zeros(n, n)
-            B = sp.zeros(n, self.n_u)
+        E = np.zeros((n, n), dtype=float)
+        G = np.zeros((n, n), dtype=float)
+        B = np.zeros((n, self.n_u), dtype=float)
 
         def stamp_G(row, col, val):
             if row is not None and col is not None:
@@ -419,14 +365,14 @@ class CircuitModel:
         # Resistors: contribute to node KCL rows only
         for e in self.R:
             a, b = col_node(e.n1), col_node(e.n2)
-            g = (1.0 / float(e.value)) if numeric else (1 / sp.nsimplify(e.value))
+            g = 1.0 / float(e.value)
             stamp_G(a, a, g); stamp_G(b, b, g)
             stamp_G(a, b, -g); stamp_G(b, a, -g)
 
         # Capacitors: contribute dv/dt terms to node KCL rows (the E matrix)
         for e in self.C:
             a, b = col_node(e.n1), col_node(e.n2)
-            c = float(e.value) if numeric else sp.nsimplify(e.value)
+            c = float(e.value)
             if a is not None: E[a, a] += c
             if b is not None: E[b, b] += c
             if a is not None and b is not None:
@@ -493,24 +439,10 @@ class CircuitModel:
             )
         self.diff_cols, self.alg_cols = diff_cols, alg_cols
 
+        self._set_state_labels()
         self._reduce()
         self._selected_output_rows: list[tuple[np.ndarray, np.ndarray]] = []
         self.output_labels: list[str] = []
-
-    def _reduce(self):
-        """
-        Reduce the stamped MNA differential-algebraic system.
-
-        This dispatcher selects the arithmetic backend requested by
-        :attr:`reduction_mode`. Both implementations populate ``A``, ``B_ss``,
-        ``Phi``, and ``Psi`` and preserve the same differential-state ordering.
-        State labels are assigned only after a successful reduction.
-        """
-        if self.reduction_mode == "fast":
-            self._reduce_fast()
-        else:
-            self._reduce_symbolic()
-        self._set_state_labels()
 
     def _set_state_labels(self):
         """Set labels for the differential state vector in `self.diff_cols` order."""
@@ -556,90 +488,6 @@ class CircuitModel:
             "yourself before building the netlist."
         )
 
-    def _solve_with_mumps(self, mat: np.ndarray, rhs: np.ndarray, context: str) -> np.ndarray:
-        """
-        Solve one or more right-hand sides with one MUMPS factorization.
-
-        Parameters
-        ----------
-        mat:
-            Square coefficient matrix.
-        rhs:
-            Vector or matrix of right-hand sides. Each matrix column is solved
-            independently while reusing the factorization of ``mat``.
-        context:
-            Subsystem name included in errors and regularization warnings.
-
-        Returns
-        -------
-        numpy.ndarray
-            Solution with the same one- or two-dimensional convention as
-            ``rhs``.
-
-        Notes
-        -----
-        The unmodified matrix is attempted first. If factorization or solution
-        fails, the method retries ``mat + eps * I`` for increasing ``eps``.
-        Regularization permits reduction of numerically singular algebraic
-        systems, but it perturbs their constraints; every successful
-        regularized solve therefore emits :class:`RuntimeWarning`.
-
-        MUMPS deliberately remains in its default unsymmetric mode. General
-        MNA systems may contain voltage-source saddle-point blocks, so they
-        are not positive definite, and the reduced transient matrix is not
-        generally symmetric. Selecting MUMPS ``sym=1`` (SPD) or passing
-        ``symmetric=True`` would therefore impose an invalid matrix property.
-        """
-        try:
-            import mumps
-            import scipy.sparse as sps
-        except ImportError as exc:
-            raise ImportError(
-                "Fast reduction mode requires `python-mumps` (module `mumps`) "
-                "and scipy.sparse to be available."
-            ) from exc
-
-        rhs_2d = rhs if rhs.ndim == 2 else rhs.reshape((-1, 1))
-        if mat.shape[0] != mat.shape[1]:
-            raise ValueError(f"{context} matrix must be square, got {mat.shape}")
-        if rhs_2d.shape[0] != mat.shape[0]:
-            raise ValueError(
-                f"{context} rhs has incompatible shape {rhs_2d.shape} for matrix {mat.shape}"
-            )
-
-        last_error: Exception | None = None
-        for eps in (0.0, 1e-15, 1e-12, 1e-9, 1e-6):
-            try:
-                if eps > 0.0:
-                    mat_reg = mat + np.eye(mat.shape[0], dtype=float) * eps
-                else:
-                    mat_reg = mat
-
-                ctx = mumps.Context()
-                ctx.set_matrix(sps.csc_matrix(mat_reg))
-                ctx.factor()
-
-                cols = []
-                for j in range(rhs_2d.shape[1]):
-                    bj = np.array(rhs_2d[:, j], dtype=float, order="F")
-                    xj = np.array(ctx.solve(bj), dtype=float)
-                    cols.append(xj)
-                x = np.column_stack(cols)
-
-                if eps > 0.0:
-                    warnings.warn(
-                        f"Fast reduction regularized singular {context} with eps={eps:.1e}",
-                        RuntimeWarning,
-                    )
-                return x if rhs.ndim == 2 else x[:, 0]
-            except (mumps.MUMPSError, ValueError, RuntimeError, TypeError) as exc:
-                last_error = exc
-                continue
-
-        raise ValueError(
-            f"Failed to solve {context} even after regularization attempts."
-        ) from last_error
-
     @staticmethod
     def _safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """
@@ -655,34 +503,6 @@ class CircuitModel:
                 if aik != 0.0:
                     out[i, :] += aik * b[k, :]
         return out
-
-    def _solve_with_sympy_numeric(self, mat: np.ndarray, rhs: np.ndarray, context: str) -> np.ndarray:
-        """Solve linear system using numeric SymPy LU; supports regularization ladder."""
-        rhs_2d = rhs if rhs.ndim == 2 else rhs.reshape((-1, 1))
-        m = sp.Matrix(mat)
-        r = sp.Matrix(rhs_2d)
-
-        try:
-            sol = m.LUsolve(r)
-            x = np.array(sol, dtype=float)
-            return x if rhs.ndim == 2 else x[:, 0]
-        except (ValueError, sp.matrices.exceptions.NonInvertibleMatrixError):
-            pass
-
-        for eps in (1e-15, 1e-12, 1e-9, 1e-6):
-            try:
-                reg = m + sp.eye(m.rows) * eps
-                sol = reg.LUsolve(r)
-                warnings.warn(
-                    f"Fast reduction regularized singular {context} with eps={eps:.1e}",
-                    RuntimeWarning,
-                )
-                x = np.array(sol, dtype=float)
-                return x if rhs.ndim == 2 else x[:, 0]
-            except (ValueError, sp.matrices.exceptions.NonInvertibleMatrixError):
-                continue
-
-        raise ValueError(f"Failed to solve {context} with numeric LU.")
 
     @staticmethod
     def _solve_with_scipy(mat: np.ndarray, rhs: np.ndarray, context: str) -> np.ndarray:
@@ -710,7 +530,7 @@ class CircuitModel:
                 solution = np.column_stack(columns)
                 if eps > 0.0:
                     warnings.warn(
-                        f"Symbolic reduction regularized singular {context} with eps={eps:.1e}",
+                        f"Circuit reduction regularized singular {context} with eps={eps:.1e}",
                         RuntimeWarning,
                     )
                 return solution if rhs.ndim == 2 else solution[:, 0]
@@ -719,18 +539,8 @@ class CircuitModel:
 
         raise ValueError(f"Failed to solve {context} with SciPy sparse LU.") from last_error
 
-    def _reduce_symbolic(self):
-        """
-        Stamp with SymPy and eliminate algebraic variables using SciPy.
-
-        The symbolic MNA blocks are converted to floating-point arrays before
-        factorization. SciPy sparse LU then solves for ``Phi`` and ``Psi`` and
-        the differential mass system without forming explicit inverses. This
-        retains the default SymPy stamping implementation while making the
-        reduction practical for substantially larger circuits. Unlike fast
-        mode, this path requires no ``python-mumps`` and applies no diagonal
-        regularization.
-        """
+    def _reduce(self):
+        """Eliminate algebraic variables and solve the mass system with SciPy."""
         E, G, B = self.E, self.G, self.B
         dr, ar = self.diff_rows, self.alg_rows
         dc, ac = self.diff_cols, self.alg_cols
@@ -761,70 +571,6 @@ class CircuitModel:
                 "state/mass subsystem",
             )
         except ValueError:
-            self._raise_state_singular()
-
-        self.A = A
-        self.B_ss = Bmat
-        self.Phi = Phi
-        self.Psi = Psi
-
-    def _reduce_fast(self):
-        """
-        Eliminate algebraic variables using floating-point linear solves.
-
-        This method implements the same block elimination and equations as
-        :meth:`_reduce_symbolic`, but avoids symbolic matrix inversion:
-
-        1. Extract ``E_dd`` and the differential/algebraic blocks of ``G`` and
-           ``B`` as ``float`` arrays.
-        2. Factor ``G_alg_a`` with MUMPS and solve for ``Phi`` and ``Psi``.
-        3. Form the Schur-complement terms involving ``G_diff_a``.
-        4. Solve the differential mass system ``E_dd`` for ``A`` and ``B_ss``.
-
-        The algebraic MUMPS factorization is reused across right-hand sides.
-        A small diagonal regularization ladder is available for numerically
-        singular systems and is always announced with a warning. The state
-        mass solve uses numeric SymPy LU in this implementation to avoid
-        environment-specific native dense-linear-algebra failures.
-
-        ``"fast"`` changes only construction cost and numerical precision; it
-        does not simplify the circuit, discard states, or alter output
-        equations. It is generally preferred for large transmission-line and
-        densely coupled RLC/K models.
-        """
-        E, G, B = self.E, self.G, self.B
-        dr, ar = self.diff_rows, self.alg_rows
-        dc, ac = self.diff_cols, self.alg_cols
-
-        if isinstance(E, np.ndarray):
-            E_dd = E[np.ix_(dr, dc)]
-            G_alg_d = G[np.ix_(ar, dc)]
-            G_alg_a = G[np.ix_(ar, ac)]
-            G_diff_d = G[np.ix_(dr, dc)]
-            G_diff_a = G[np.ix_(dr, ac)]
-            B_alg = B[np.ix_(ar, range(self.n_u))]
-            B_diff = B[np.ix_(dr, range(self.n_u))]
-        else:
-            E_dd = np.array(E[dr, dc].evalf(), dtype=float)
-            G_alg_d = np.array(G[ar, dc].evalf(), dtype=float)
-            G_alg_a = np.array(G[ar, ac].evalf(), dtype=float)
-            G_diff_d = np.array(G[dr, dc].evalf(), dtype=float)
-            G_diff_a = np.array(G[dr, ac].evalf(), dtype=float)
-            B_alg = np.array(B[ar, :].evalf(), dtype=float)
-            B_diff = np.array(B[dr, :].evalf(), dtype=float)
-
-        try:
-            Phi = -self._solve_with_mumps(G_alg_a, G_alg_d, "algebraic subsystem")
-            Psi = self._solve_with_mumps(G_alg_a, B_alg, "algebraic subsystem")
-        except (ImportError, ValueError):
-            self._raise_algebraic_singular()
-
-        try:
-            gphi = self._safe_matmul(G_diff_a, Phi)
-            gpsi = self._safe_matmul(G_diff_a, Psi)
-            A = -self._solve_with_mumps(E_dd, G_diff_d + gphi, "state/mass subsystem")
-            Bmat = self._solve_with_mumps(E_dd, B_diff - gpsi, "state/mass subsystem")
-        except (ImportError, ValueError):
             self._raise_state_singular()
 
         self.A = A
@@ -1023,8 +769,6 @@ class NetlistStateSpace(StateSpace):
         Names of R, L, C, voltage-source, or current-source dipoles exposed as
         current outputs. Positive current follows each netlist ``n1 -> n2``
         declaration.
-    reduction_mode:
-        Circuit reduction backend passed to :class:`CircuitModel`.
     initial_value:
         Initial differential state. Defaults to zero for every state.
 
@@ -1042,7 +786,6 @@ class NetlistStateSpace(StateSpace):
     ...     "filter.net",
     ...     output_voltages=["n1"],
     ...     output_currents=["Rload"],
-    ...     reduction_mode="fast",
     ... )
     """
 
@@ -1051,7 +794,6 @@ class NetlistStateSpace(StateSpace):
         netlist: str | Path,
         output_voltages: list[str] | None = None,
         output_currents: list[str] | None = None,
-        reduction_mode: ReductionMode = "symbolic",
         initial_value: np.ndarray | None = None,
     ):
         if isinstance(netlist, Path):
@@ -1066,7 +808,7 @@ class NetlistStateSpace(StateSpace):
         else:
             raise TypeError("netlist must be a string or pathlib.Path")
 
-        self.model = CircuitModel(elements, reduction_mode=reduction_mode)
+        self.model = CircuitModel(elements)
         for node_name in output_voltages or []:
             self.model.add_node_voltage_output(node_name)
         for dipole_name in output_currents or []:
