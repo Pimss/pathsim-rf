@@ -822,8 +822,8 @@ class CircuitModel:
         try:
             gphi = self._safe_matmul(G_diff_a, Phi)
             gpsi = self._safe_matmul(G_diff_a, Psi)
-            A = -self._solve_with_sympy_numeric(E_dd, G_diff_d + gphi, "state/mass subsystem")
-            Bmat = self._solve_with_sympy_numeric(E_dd, B_diff - gpsi, "state/mass subsystem")
+            A = -self._solve_with_mumps(E_dd, G_diff_d + gphi, "state/mass subsystem")
+            Bmat = self._solve_with_mumps(E_dd, B_diff - gpsi, "state/mass subsystem")
         except (ImportError, ValueError):
             self._raise_state_singular()
 
