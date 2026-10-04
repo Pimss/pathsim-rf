@@ -73,7 +73,7 @@ class TestNetlistStateSpace(unittest.TestCase):
             NetlistStateSpace(TEST_DIR / "missing.net")
     
     def test_path_str_import(self):
-        """Test if str args allows file to be imported"""
+        """Test str netlist_path arg allows file to be imported"""
         netlist_path = TEST_DIR / "filter.net"
         NetlistStateSpace(str(netlist_path))
 
