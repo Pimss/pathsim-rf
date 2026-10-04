@@ -10,9 +10,11 @@ import unittest
 from pathlib import Path
 import numpy as np
 import importlib.util
+TEST_DIR = Path(__file__).parent
 
 from pathsim_rf.netlist_to_statespace import CircuitModel, NetlistStateSpace, parse_netlist_file, parse_netlist
 from pathsim.blocks.lti import StateSpace
+
 
 # TESTS ================================================================================
 
@@ -21,16 +23,13 @@ class TestNetlistStateSpace(unittest.TestCase):
 
     def test_path_string_matches_manual_circuit_model(self):
         """Test CircuitModel is correctly used within NetlistStateSpace"""
-        netlist_path = "filter.net"
+        netlist_path = TEST_DIR / "filter.net"
         model = CircuitModel(parse_netlist_file(netlist_path))
         model.add_node_voltage_output("n1")
         model.add_dipole_current_output("Rload")
         A, B, C, D = model.get_system()
 
-        block = NetlistStateSpace(
-            str(netlist_path),
-            output_voltages=["n1"],
-            output_currents=["Rload"])
+        block = NetlistStateSpace(netlist_path, output_voltages=["n1"], output_currents=["Rload"])
 
         self.assertIsInstance(block, StateSpace)
         np.testing.assert_allclose(block.A, A)
@@ -43,9 +42,9 @@ class TestNetlistStateSpace(unittest.TestCase):
 
     def test_path_object_preserves_feedback_source_input(self):
         """Test current sources feedback used to chain models"""
-        block = NetlistStateSpace("filter_without_load.net",
-            output_voltages=["n1"],
-            output_currents=["Lfilter"])
+        block = NetlistStateSpace(TEST_DIR / "filter_without_load.net",
+                                  output_voltages=["n1"],
+                                  output_currents=["Lfilter"])
 
         self.assertEqual(block.input_labels, ["V1", "Bload"])
         self.assertEqual(block.output_labels, ["V(n1)", "I(Lfilter)"])
@@ -71,11 +70,16 @@ class TestNetlistStateSpace(unittest.TestCase):
     def test_explicit_missing_path_raises(self):
         """Test missing .net file provided"""
         with self.assertRaises(FileNotFoundError):
-            NetlistStateSpace(Path("missing.net"))
+            NetlistStateSpace(TEST_DIR / "missing.net")
+    
+    def test_path_str_import(self):
+        """Test if str args allows file to be imported"""
+        netlist_path = TEST_DIR / "filter.net"
+        NetlistStateSpace(str(netlist_path))
 
     def test_invalid_output_names_raise(self):
         """Test invalid output names provided for state space generated"""
-        netlist_path = "filter.net"
+        netlist_path = TEST_DIR / "filter.net"
         with self.assertRaisesRegex(ValueError, "Unknown node"):
             NetlistStateSpace(netlist_path, output_voltages=["missing"])
         with self.assertRaisesRegex(ValueError, "Unknown dipole"):
